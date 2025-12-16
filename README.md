@@ -33,3 +33,17 @@ latitude: 36.64508982420638
 longitude: -97.44168729994205
 merchant Latitude: 36.85395341921114
 merchant longitude: -99.40135742382182
+
+
+
+
+AI Chatbot Inputs:
+Why was this transaction flagged as fraud?
+Show me top 10 merchants with highest fraud risk today.
+What patterns are common in flagged transactions?
+How many fraud cases were detected in the last 24 hours?
+What is the average fraud amount compared to legitimate transactions?
+Explain how RandomForest works in fraud detection.
+Why is distance between merchant and customer important?
+Should we block this card immediately?
+Do you want to retrain the model with new data?
