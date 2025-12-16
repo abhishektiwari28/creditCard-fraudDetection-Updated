@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 import pandas as pd
 import joblib
@@ -7,7 +7,9 @@ from fastapi.responses import FileResponse
 import os
 import numpy as np
 from utils import send_fraud_alert_email, generate_fraud_report
-from typing import Optional
+from typing import Optional, List
+from sqlalchemy.orm import Session
+from database import SessionLocal, engine, init_db, Transaction
 
 app = FastAPI()
 
@@ -19,6 +21,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Initialize Database
+init_db()
 
 # Load Model and Artifacts
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -35,8 +40,13 @@ except Exception as e:
     scaler = None
     encoders = None
 
-# In-memory history store
-history_db = []
+# Dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 class TransactionData(BaseModel):
     trans_date_trans_time: str
@@ -57,10 +67,10 @@ class ChatQuery(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": "Fraud Detection API V3 is running"}
+    return {"message": "Fraud Detection API V3 (SQLite) is running"}
 
 @app.post("/predict")
-def predict_fraud(data: TransactionData):
+def predict_fraud(data: TransactionData, db: Session = Depends(get_db)):
     if not model:
         raise HTTPException(status_code=500, detail="Model not loaded")
 
@@ -115,30 +125,49 @@ def predict_fraud(data: TransactionData):
             risk_level = "Fraud"
             is_fraud = True
 
+        result_summary = f"{risk_level} detected ({risk_score*100:.1f}%)"
+        
+        # Action Taken
+        action_taken = "None"
+        if risk_level == "Fraud":
+            action_taken = "Card Blocked & Email Sent"
+            # In a real app, we'd define the email recipient better or use the user's email
+            send_fraud_alert_email("abhishektiwari2807@gmail.com", {**data.dict(), "risk_level": risk_level, "risk_score": risk_score})
+        elif risk_level == "High Risk":
+            action_taken = "Flagged for Review"
+
+        # Save to Database
+        db_transaction = Transaction(
+            merchant=data.merchant,
+            category=data.category,
+            amt=data.amt,
+            gender=data.gender,
+            state=data.state,
+            job=data.job,
+            city_pop=data.city_pop,
+            lat=data.lat,
+            long=data.long,
+            merch_lat=data.merch_lat,
+            merch_lon=data.merch_lon,
+            dist=float(dist),
+            prediction=int(prediction),
+            risk_score=risk_score,
+            is_fraud=is_fraud,
+            risk_level=risk_level,
+            action_taken=action_taken
+        )
+        db.add(db_transaction)
+        db.commit()
+        db.refresh(db_transaction)
+
         result = {
             "prediction": int(prediction),
             "risk_score": risk_score,
             "is_fraud": is_fraud,
             "risk_level": risk_level,
-            "details": f"{risk_level} detected ({risk_score*100:.1f}%)"
+            "details": result_summary,
+            "id": db_transaction.id
         }
-        
-        # Save to history
-        history_record = data.dict()
-        history_record.update(result)
-        history_record['id'] = len(history_db) + 1
-        history_record['dist'] = float(dist)
-        
-        # Auto Actions for Fraud
-        if risk_level == "Fraud":
-            history_record['action_taken'] = "Card Blocked & Email Sent"
-            send_fraud_alert_email("abhishektiwari2807@gmail.com", history_record)
-        elif risk_level == "High Risk":
-            history_record['action_taken'] = "Flagged for Review"
-        else:
-            history_record['action_taken'] = "None"
-
-        history_db.append(history_record)
         
         return result
 
@@ -147,41 +176,50 @@ def predict_fraud(data: TransactionData):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/history")
-def get_history():
-    return history_db
+def get_history(db: Session = Depends(get_db)):
+    transactions = db.query(Transaction).all()
+    # Convert to list of dicts if needed, or let Pydantic handle it if we defined response_model
+    # For now, manually return what frontend expects
+    return transactions
 
 @app.get("/visualize")
-def get_visualization_data():
-    return history_db
+def get_visualization_data(db: Session = Depends(get_db)):
+    return db.query(Transaction).all()
 
 @app.get("/report/{id}")
-def download_report(id: int):
+def download_report(id: int, db: Session = Depends(get_db)):
     # Find transaction
-    record = next((item for item in history_db if item["id"] == id), None)
+    record = db.query(Transaction).filter(Transaction.id == id).first()
     if not record:
         raise HTTPException(status_code=404, detail="Transaction not found")
     
-    filepath = generate_fraud_report(record)
+    # Convert SQLAlchemy model to dict for report generation
+    record_dict = record.__dict__
+    
+    filepath = generate_fraud_report(record_dict)
     return FileResponse(filepath, media_type='application/pdf', filename=f"report_{id}.pdf")
 
 @app.post("/chat")
-def chat_bot(query_data: ChatQuery):
+def chat_bot(query_data: ChatQuery, db: Session = Depends(get_db)):
     query = query_data.query.lower()
     
+    # Fetch history for context
+    history_db = db.query(Transaction).all()
+
     # 1. Model Explainability
     if "why" in query and "flagged" in query:
         return {"response": "This transaction was flagged because of a high transaction amount combined with an unusual location distance from your typical spending area. The model identified these as the strongest contributing factors."}
 
     # 2. Daily stats / Fraud cases
     if "how many fraud" in query or "stats" in query:
-        fraud_count = len([x for x in history_db if x['risk_level'] == 'Fraud'])
+        fraud_count = len([x for x in history_db if x.risk_level == 'Fraud'])
         total = len(history_db)
         return {"response": f"I have analyzed {total} transactions in this session. {fraud_count} were detected as potential fraud."}
 
     # 3. Top Merchants
     if "top 10 merchants" in query:
         # Simple counting logic
-        merchants = [x['merchant'] for x in history_db if x['risk_level'] in ['High Risk', 'Fraud']]
+        merchants = [x.merchant for x in history_db if x.risk_level in ['High Risk', 'Fraud']]
         if not merchants:
             return {"response": "No high-risk merchants detected yet."}
         from collections import Counter
